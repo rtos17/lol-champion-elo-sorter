@@ -958,6 +958,23 @@ function drawChampionPool(){
             updateStabilityDisplay();
             updatePoolCounter();
         };
+        card.onclick = (e) => {
+
+            // prevent double trigger if checkbox itself was clicked
+            if(e.target === checkbox) return;
+
+            champ.enabled = !champ.enabled;
+            checkbox.checked = champ.enabled;
+
+            card.classList.toggle("disabled", !champ.enabled);
+
+            save();
+            startMatch();
+            drawTierLists();
+            updateProgress();
+            updateStabilityDisplay();
+            updatePoolCounter();
+        };
 
         const img = document.createElement("img");
         img.src = champ.image;
