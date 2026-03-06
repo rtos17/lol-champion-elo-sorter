@@ -287,6 +287,13 @@ async function loadChampions(){
             if(c.isNew === undefined) c.isNew = false;
             if(c.games === undefined) c.games = 0;
             if(c.wins === undefined) c.wins = 0;
+            if(c.mu === undefined){
+                c.mu = 1200;
+            }
+
+            if(c.sigma === undefined){
+                c.sigma = 350;
+            }
             if(c.enabled === undefined) c.enabled = true;
 
             // 🔥 convert old string roles → array
@@ -321,7 +328,8 @@ async function loadChampions(){
         name:c.name,
         image:`https://ddragon.leagueoflegends.com/cdn/${CURRENT_VERSION}/img/champion/${c.image.full}`,
         tags:c.tags,
-        elo:BASE_ELO,
+        mu:1200,
+        sigma:350,
         wins:0,
         games:0,
         isNew:false,
@@ -446,7 +454,7 @@ function startMatch() {
 
         if (c.id === a.id) return false;
 
-        if (Math.abs(c.elo - a.elo) > eloWindow)
+        if (Math.abs(getRating(c) - getRating(a)) > eloWindow)
             return false;
 
         return true;
@@ -511,16 +519,16 @@ function showMatch(){
     document.getElementById("img2").src = b.image;
 
     document.getElementById("name1").textContent =
-        `${a.name} (${a.elo}) — ${a.roleLabel.join("/")}`;
+        `${a.name} | Est:${Math.round(a.mu)} | Rank:${Math.round(getRating(a))}`;
 
     document.getElementById("name2").textContent =
-        `${b.name} (${b.elo}) — ${b.roleLabel.join("/")}`;
+        `${b.name} | Est:${Math.round(b.mu)} | Rank:${Math.round(getRating(b))}`;
 
     document.getElementById("tier1").textContent =
-        `Tier ${getTier(a)}`;
+        `Tier ${getTier(a)} • ${a.roleLabel.join("/")}`;
 
     document.getElementById("tier2").textContent =
-        `Tier ${getTier(b)}`;
+        `Tier ${getTier(b)} • ${b.roleLabel.join("/")}`;
 }
 
 /* ---------- ELO ---------- */
@@ -532,18 +540,7 @@ function chooseWinner(i){
     const winner=currentMatch[i-1];
     const loser=currentMatch[i===1?1:0];
 
-    let K = 30;
-    if(winner.games < 20 || winner.isNew) K = 80;
-
-    const expected =
-        1/(1+Math.pow(10,(loser.elo-winner.elo)/400));
-
-    winner.elo += Math.round(K*(1-expected));
-    loser.elo  -= Math.round(K*(expected));
-
-    winner.wins++;
-    winner.games++;
-    loser.games++;
+    updateRatings(winner, loser);
 
     const pool = champions.filter(passesRoleFilter);
     const required = getRequiredGames(pool.length);
@@ -556,6 +553,34 @@ function chooseWinner(i){
     drawTierLists();
     updateProgress();
     updateStabilityDisplay(); // ⭐ ADD THIS
+}
+
+function expectedWin(a,b){
+
+    const diff = a.mu - b.mu;
+    const uncertainty = Math.sqrt(a.sigma*a.sigma + b.sigma*b.sigma);
+
+    return 1/(1+Math.exp(-diff/uncertainty));
+}
+
+function updateRatings(winner, loser){
+
+    const K = 32;
+
+    const expected = expectedWin(winner, loser);
+
+    const change = K * (1 - expected);
+
+    winner.mu += change;
+    loser.mu  -= change;
+
+    winner.sigma = Math.max(60, winner.sigma * 0.97);
+    loser.sigma  = Math.max(60, loser.sigma * 0.97);
+
+    winner.games++;
+    loser.games++;
+
+    winner.wins++;
 }
 
 function getTierDistribution(poolSize){
@@ -607,7 +632,7 @@ function getTier(champ){
         ? cachedSortedPool
         : champions
             .filter(passesRoleFilter)
-            .sort((a,b)=>b.elo-a.elo);
+            .sort((a,b)=>getRating(b)-getRating(a));
 
     if(pool.length === 0) return "S";
 
@@ -629,6 +654,10 @@ function getTier(champ){
 
     // fallback safety
     return dist[dist.length - 1].tier;
+}
+
+function getRating(champ){
+    return champ.mu - 3*champ.sigma;
 }
 
 /* ---------- TIER BOARD ---------- */
@@ -659,7 +688,7 @@ function drawTierLists(){
     });
 
     // sort pool
-    cachedSortedPool = [...pool].sort((a,b) => b.elo - a.elo);
+    cachedSortedPool = [...pool].sort((a,b) => getRating(b) - getRating(a));
     const sorted = cachedSortedPool;
 
     // fill tiers
@@ -671,7 +700,7 @@ function drawTierLists(){
         const div = document.createElement("div");
         div.className = "tierChamp";
         div.textContent =
-            `${c.name} (${c.elo}) — ${c.roleLabel.join("/")}`;
+            `${c.name} (${Math.round(getRating(c))}) — ${c.roleLabel.join("/")}`;
 
         const target = document.getElementById("tier-" + tier);
         if (target) target.appendChild(div);
@@ -686,7 +715,7 @@ function exportTxt(){
 
     const sorted = [...champions]
         .filter(passesRoleFilter)
-        .sort((a,b)=>b.elo-a.elo);
+        .sort((a,b)=>getRating(b)-getRating(a));
     
     if(sorted.length === 0){
         alert("No champions to export.");
@@ -705,7 +734,7 @@ function exportTxt(){
         text += `===== TIER ${tier} =====\n`;
 
         tierChamps.forEach((c,i)=>{
-            text += `${i+1}. ${c.name} — ${c.elo} — ${c.roleLabel.join("/")}\n`;
+            text += `${i+1}. ${c.name} — ${Math.round(getRating(c))} — ${c.roleLabel.join("/")}\n`;
         });
 
         text += "\n";
@@ -1083,7 +1112,8 @@ function resetAll(){
 
     // ⭐ reset stats BUT keep selection
     champions.forEach(c => {
-        c.elo = BASE_ELO;
+        c.mu = 1200;
+        c.sigma = 350;
         c.games = 0;
         c.wins = 0;
         c.isNew = false;
