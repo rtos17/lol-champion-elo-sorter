@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Champion Elo</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<h1>Champion Elo Ranking</h1>
+
+<div id="progressWrapper">
+    <div id="progressBar"></div>
+</div>
+
+<div id="progressText">0% completed</div>
+
+<div id="stabilityBox">
+    <span id="stabilityBadge">Checking...</span>
+    <span id="stabilityText"></span>
+</div>
+
+<div id="match">
+    <div class="champ" onclick="chooseWinner(1)">
+        <img id="img1">
+        <p id="name1"></p>
+        <p id="tier1"></p>
+    </div>
+
+    <div class="vs">VS</div>
+
+    <div class="champ" onclick="chooseWinner(2)">
+        <img id="img2">
+        <p id="name2"></p>
+        <p id="tier2"></p>
+    </div>
+</div>
+
+<div id="slots">
+  <button class="slotBtn" data-slot="1" onclick="selectSlot(1)">Slot 1</button>
+  <button class="slotBtn" data-slot="2" onclick="selectSlot(2)">Slot 2</button>
+  <button class="slotBtn" data-slot="3" onclick="selectSlot(3)">Slot 3</button>
+</div>
+
+<button onclick="exportTxt()">📄 Export TXT</button>
+<button onclick="syncNewChampions()">Sync New Champions</button>
+<button type="button" onclick="resetAll()">Reset</button>
+<button onclick="exportProgress()">💾 Download</button>
+
+<label class="uploadBtn">
+    📂 Load
+    <input type="file" accept=".json" onchange="importProgress(event)" hidden>
+</label>
+
+
+<div id="ranking" style="display:none;"></div>
+
+<button onclick="toggleTierList()">📊 Show / Hide Tierlist</button>
+
+<div id="tiers" style="display:none;">
+    <div class="tierBox"><h3>S+</h3><div id="tier-S+"></div></div>
+    <div class="tierBox"><h3>S</h3><div id="tier-S"></div></div>
+    <div class="tierBox"><h3>A</h3><div id="tier-A"></div></div>
+    <div class="tierBox"><h3>B</h3><div id="tier-B"></div></div>
+    <div class="tierBox"><h3>C</h3><div id="tier-C"></div></div>
+    <div class="tierBox"><h3>D</h3><div id="tier-D"></div></div>
+</div>
+
+<h2>Champion Pool</h2>
+<button onclick="setAllChampions(true)">Select All</button>
+<button onclick="setAllChampions(false)">Select None</button>
+<button onclick="setRoleFilter('All')">All</button>
+<button onclick="setRoleFilter('Top')">Top</button>
+<button onclick="setRoleFilter('Jungle')">Jungle</button>
+<button onclick="setRoleFilter('Mid')">Mid</button>
+<button onclick="setRoleFilter('ADC')">ADC</button>
+<button onclick="setRoleFilter('Support')">Support</button>
+<div id="poolCounter">0 / 0 selected</div>
+<div id="championPool"></div>
+
+<script src="script.js"></script>
+</body>
+</html>
