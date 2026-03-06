@@ -248,3 +248,7 @@ button,
         width:90%;
     }
 }
+
+button{
+    touch-action:manipulation;
+}
