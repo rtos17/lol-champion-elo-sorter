@@ -204,3 +204,47 @@ button,
 .tierBox.hidden{
     display:none !important;   /* ⭐ NEW (strong hide) */
 }
+
+/* =========================
+   MOBILE FIX
+========================= */
+
+@media (max-width: 600px){
+
+    body{
+        padding:0 12px; /* space from screen edges */
+    }
+
+    #match{
+        gap:20px;
+        margin-top:25px;
+        padding:0 10px; /* prevents edge touching */
+    }
+
+    .champ{
+        width:40%;
+    }
+
+    .champ img{
+        width:110px; /* smaller images on phones */
+        max-width:100%;
+    }
+
+    #name1,
+    #name2{
+        font-size:14px;
+        word-wrap:break-word; /* prevents cut names */
+    }
+
+    #tiers{
+        gap:12px;
+    }
+
+    .tierBox{
+        width:140px;
+    }
+
+    #progressWrapper{
+        width:90%;
+    }
+}
