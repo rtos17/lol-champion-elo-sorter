@@ -1,38 +1,40 @@
-const BASE_ELO = 1200;
+/* ==============================================
+   state.js — Shared application state
+   All modules read/write these variables.
+   ============================================== */
 
 let champions = [];
 let currentMatch = [];
 let CURRENT_VERSION = null;
 let currentSlot = 1;
 let cachedSortedPool = [];
+let debugMode = false;
 
-/* ---------- DYNAMIC STABILITY TARGET ---------- */
-
-function getRequiredGames(poolSize){
-
-    if(poolSize >= 100) return 20;
-    if(poolSize >= 40)  return 18;
-    if(poolSize >= 20)  return 15;
-    if(poolSize >= 10)  return 12;
-    if(poolSize >= 5)   return 8;
-    return 6; // tiny pools (2–4 champs)
-}
-
-/* ---------- SLOT ROLE STORAGE ---------- */
-
+// Per-slot role filter memory
 let slotRoleFilters = {
     1: "All",
     2: "All",
     3: "All"
 };
 
+// Anti-repeat matchmaking memory
+let recentMatches = [];
+let recentChampions = [];
+
+const BASE_ELO          = 1200;
+const MATCH_HISTORY_LIMIT = 8;   // how many past matches to remember
+const CHAMPION_COOLDOWN   = 3;   // soft cooldown per champion
+
 function getCurrentRoleFilter(){
     return slotRoleFilters[currentSlot] || "All";
 }
 
-/* ---------- MANUAL ROLE OVERRIDES (ARRAY FORMAT) ---------- */
-
-/* ===== OFFICIAL ROLE LIST (from Wiki roster) ===== */
+function getSlotKey(){
+    return `champions_slot_${currentSlot}`;
+}
+/* ==============================================
+   roles.js — Role data and detection
+   ============================================== */
 
 const ROLE_OVERRIDES = {
   "Aatrox": ["Top"],
@@ -207,73 +209,278 @@ const ROLE_OVERRIDES = {
   "Zyra": ["Support", "Mid"]
 };
 
-/* ---------- GET LATEST VERSION ---------- */
-
-async function getLatestVersion(){
-    const res = await fetch(
-        "https://ddragon.leagueoflegends.com/api/versions.json"
-    );
-    const versions = await res.json();
-    return versions[0];
-}
-
-function getActiveTiers(poolSize){
-
-    if(poolSize >= 80) return ["S+","S","A","B","C","D"];
-    if(poolSize >= 40) return ["S+","S","A","B","C"];
-    if(poolSize >= 20) return ["S+","S","A","B"];
-    if(poolSize >= 10) return ["S+","S","A"];
-    return ["S+","S"];
-}
-
-/* ---------- STRONG ANTI-REPEAT ---------- */
-
-let recentMatches = [];
-let recentChampions = [];
-
-const MATCH_HISTORY_LIMIT = 8;   // how many past matches we remember
-const CHAMPION_COOLDOWN = 3;     // soft cooldown per champion
-
-/* ---------- ROLE DETECTION (RETURNS ARRAY) ---------- */
+/* ---------- ROLE DETECTION ---------- */
 
 function detectRoleLabel(tags, champId, champName){
 
-    // ⭐ manual override first
-    // ⭐ try by display name first (best match to wiki)
-    if (champName && ROLE_OVERRIDES[champName]) {
-        return ROLE_OVERRIDES[champName];
-    }
+    // Manual override takes priority (matched by display name first)
+    if(champName && ROLE_OVERRIDES[champName]) return ROLE_OVERRIDES[champName];
+    if(champId   && ROLE_OVERRIDES[champId])   return ROLE_OVERRIDES[champId];
 
-    // ⭐ fallback to Riot id if ever needed
-    if (champId && ROLE_OVERRIDES[champId]) {
-        return ROLE_OVERRIDES[champId];
-    }
-
+    // Fallback: infer from Riot tags
     const roles = [];
 
-    if(tags.includes("Fighter") || tags.includes("Tank"))
-        roles.push("Top");
-
-    if(tags.includes("Assassin"))
-        roles.push("Jungle","Mid");
-
-    if(tags.includes("Mage"))
-        roles.push("Mid");
-
-    if(tags.includes("Marksman"))
-        roles.push("ADC");
-
-    if(tags.includes("Support"))
-        roles.push("Support");
+    if(tags.includes("Fighter") || tags.includes("Tank")) roles.push("Top");
+    if(tags.includes("Assassin"))  roles.push("Jungle", "Mid");
+    if(tags.includes("Mage"))      roles.push("Mid");
+    if(tags.includes("Marksman"))  roles.push("ADC");
+    if(tags.includes("Support"))   roles.push("Support");
 
     const unique = [...new Set(roles)];
-
-    if(unique.length === 0) return ["Top"];
-
-    return unique;
+    return unique.length ? unique : ["Top"];
 }
 
-/* ---------- LOAD CHAMPIONS ---------- */
+/* ---------- ROLE FILTER ---------- */
+
+function passesRoleFilter(champ){
+    if(!champ.enabled) return false;
+    const roleFilter = getCurrentRoleFilter();
+    if(roleFilter === "All") return true;
+    return champ.roleLabel.includes(roleFilter);
+}
+/* ==============================================
+   rating.js — Elo math and tier classification
+   ============================================== */
+
+/* ---------- CONSERVATIVE RATING ---------- */
+
+// Lower confidence = wider uncertainty = lower displayed rating.
+// Uses a TrueSkill-style conservative estimate: mu - 3*sigma.
+function getRating(champ){
+    return champ.mu - 3 * champ.sigma;
+}
+
+/* ---------- ELO MATH ---------- */
+
+function expectedWin(a, b){
+    const diff        = a.mu - b.mu;
+    const uncertainty = Math.sqrt(a.sigma * a.sigma + b.sigma * b.sigma);
+    return 1 / (1 + Math.exp(-diff / uncertainty));
+}
+
+function updateRatings(winner, loser){
+    const K        = 32;
+    const expected = expectedWin(winner, loser);
+    const change   = K * (1 - expected);
+
+    winner.mu += change;
+    loser.mu  -= change;
+
+    // Sigma decays over time — uncertainty shrinks as more matches are played
+    winner.sigma = Math.max(60, winner.sigma * 0.97);
+    loser.sigma  = Math.max(60, loser.sigma  * 0.97);
+
+    winner.games++;
+    loser.games++;
+    winner.wins++;
+}
+
+/* ---------- STABILITY / PROGRESS ---------- */
+
+// How many games per champion are needed before the ranking is considered reliable
+function getRequiredGames(poolSize){
+    if(poolSize >= 100) return 20;
+    if(poolSize >= 40)  return 18;
+    if(poolSize >= 20)  return 15;
+    if(poolSize >= 10)  return 12;
+    if(poolSize >= 5)   return 8;
+    return 6; // tiny pools (2–4 champs)
+}
+
+/* ---------- TIER DISTRIBUTION ---------- */
+
+// Returns percentage buckets per tier, scaled to pool size so small pools
+// don't end up with empty tiers.
+function getTierDistribution(poolSize){
+
+    if(poolSize < 10) return [
+        { tier: "S+", pct: 0.5  },
+        { tier: "S",  pct: 0.5  }
+    ];
+
+    if(poolSize < 20) return [
+        { tier: "S+", pct: 0.20 },
+        { tier: "S",  pct: 0.30 },
+        { tier: "A",  pct: 0.30 },
+        { tier: "B",  pct: 0.20 }
+    ];
+
+    if(poolSize < 40) return [
+        { tier: "S+", pct: 0.10 },
+        { tier: "S",  pct: 0.20 },
+        { tier: "A",  pct: 0.25 },
+        { tier: "B",  pct: 0.25 },
+        { tier: "C",  pct: 0.20 }
+    ];
+
+    // Full distribution for large pools
+    return [
+        { tier: "S+", pct: 0.05 },
+        { tier: "S",  pct: 0.15 },
+        { tier: "A",  pct: 0.25 },
+        { tier: "B",  pct: 0.25 },
+        { tier: "C",  pct: 0.20 },
+        { tier: "D",  pct: 0.10 }
+    ];
+}
+
+/* ---------- TIER LOOKUP ---------- */
+
+// Looks up which tier a champion belongs to based on their rank position
+// in the sorted pool. Callers should ensure cachedSortedPool is fresh
+// (drawTierLists() resets it before filling it).
+function getTier(champ){
+
+    const pool = cachedSortedPool.length
+        ? cachedSortedPool
+        : champions.filter(passesRoleFilter).sort((a, b) => getRating(b) - getRating(a));
+
+    if(pool.length === 0) return "S";
+
+    const dist  = getTierDistribution(pool.length);
+    const index = pool.findIndex(c => c.id === champ.id);
+
+    if(index === -1) return "S";
+
+    const positionPct = (index + 1) / pool.length;
+    let cumulative = 0;
+
+    for(const bucket of dist){
+        cumulative += bucket.pct;
+        if(positionPct <= cumulative) return bucket.tier;
+    }
+
+    return dist[dist.length - 1].tier; // fallback safety
+}
+/* ==============================================
+   matchmaking.js — Match selection and anti-repeat logic
+   ============================================== */
+
+/* ---------- ANTI-REPEAT MEMORY ---------- */
+
+function rememberMatch(a, b){
+    const key = [a.id, b.id].sort().join("|");
+
+    recentMatches.unshift(key);
+    if(recentMatches.length > MATCH_HISTORY_LIMIT) recentMatches.pop();
+
+    recentChampions.unshift(a.id);
+    recentChampions.unshift(b.id);
+    if(recentChampions.length > MATCH_HISTORY_LIMIT * 2){
+        recentChampions = recentChampions.slice(0, MATCH_HISTORY_LIMIT * 2);
+    }
+}
+
+function wasRecentPair(a, b){
+    return recentMatches.includes([a.id, b.id].sort().join("|"));
+}
+
+// Returns how many times a champion appeared in the recent cooldown window.
+// Lower score = preferred candidate.
+function championCooldownScore(champId){
+    let count = 0;
+    for(let i = 0; i < CHAMPION_COOLDOWN && i < recentChampions.length; i++){
+        if(recentChampions[i] === champId) count++;
+    }
+    return count;
+}
+
+/* ---------- MATCHMAKING ---------- */
+
+function startMatch(){
+
+    const pool = champions.filter(passesRoleFilter);
+
+    if(pool.length < 2){
+        currentMatch = [];
+        const name1 = document.getElementById("name1");
+        const name2 = document.getElementById("name2");
+        if(name1) name1.textContent = "Not enough champions";
+        if(name2) name2.textContent = "";
+        return;
+    }
+
+    /* --- Pick Champion A: biased toward least-played --- */
+
+    const priorityPool = [...pool].sort((a, b) => (a.games || 0) - (b.games || 0));
+    const bias  = pool.length > 40 ? 1.6 : 1.9;
+    const indexA = Math.floor(Math.pow(Math.random(), bias) * priorityPool.length);
+    const a = priorityPool[indexA];
+
+    /* --- Build candidate pool for Champion B within Elo window --- */
+
+    let eloWindow = 200;
+    if(pool.length < 40) eloWindow = 300;
+    if(pool.length < 20) eloWindow = 500;
+    if(pool.length < 10) eloWindow = 9999;
+
+    let candidates = pool.filter(c =>
+        c.id !== a.id &&
+        Math.abs(getRating(c) - getRating(a)) <= eloWindow
+    );
+
+    if(candidates.length === 0) candidates = pool.filter(c => c.id !== a.id);
+
+    /* --- Apply anti-repeat filter --- */
+
+    let filtered = candidates.filter(c => !wasRecentPair(a, c));
+
+    // If anti-repeat leaves too few options, fall back to full candidate list
+    if(filtered.length < Math.max(2, Math.floor(pool.length * 0.15))){
+        filtered = candidates;
+    }
+
+    /* --- Sort by cooldown score then least games (prefer fresh matchups) --- */
+
+    filtered.sort((x, y) => {
+        const cd = championCooldownScore(x.id) - championCooldownScore(y.id);
+        if(cd !== 0) return cd;
+        return (x.games || 0) - (y.games || 0);
+    });
+
+    /* --- Pick from top 30% of candidates randomly --- */
+
+    const topCandidates = filtered.slice(0, Math.max(1, Math.floor(filtered.length * 0.3)));
+    const b = topCandidates[Math.floor(Math.random() * topCandidates.length)];
+
+    currentMatch = [a, b];
+    rememberMatch(a, b);
+    showMatch();
+}
+/* ==============================================
+   storage.js — Persistence, import/export, and sync
+   ============================================== */
+
+/* ---------- BACKFILL ---------- */
+
+// Patches older saved data that may be missing newer fields.
+// Safe to run on every load.
+function backfillChampion(c){
+    if(c.isNew    === undefined) c.isNew    = false;
+    if(c.games    === undefined) c.games    = 0;
+    if(c.wins     === undefined) c.wins     = 0;
+    if(c.mu       === undefined) c.mu       = 1200;
+    if(c.sigma    === undefined) c.sigma    = 350;
+    if(c.enabled  === undefined) c.enabled  = true;
+
+    // Migrate old string role format to array
+    if(typeof c.roleLabel === "string") c.roleLabel = c.roleLabel.split("/");
+    if(!c.roleLabel && c.tags) c.roleLabel = detectRoleLabel(c.tags, c.id, c.name);
+}
+
+/* ---------- SAVE ---------- */
+
+function save(){
+    localStorage.setItem(getSlotKey(), JSON.stringify(champions));
+}
+
+/* ---------- LOAD ---------- */
+
+async function getLatestVersion(){
+    const res = await fetch("https://ddragon.leagueoflegends.com/api/versions.json");
+    const versions = await res.json();
+    return versions[0];
+}
 
 async function loadChampions(){
 
@@ -281,597 +488,224 @@ async function loadChampions(){
 
     if(saved){
         champions = JSON.parse(saved);
+        champions.forEach(backfillChampion);
+        refreshAll();
+        return;
+    }
 
-        // 🔥 backfill safety
-        champions.forEach(c=>{
-            if(c.isNew === undefined) c.isNew = false;
-            if(c.games === undefined) c.games = 0;
-            if(c.wins === undefined) c.wins = 0;
-            if(c.mu === undefined){
-                c.mu = 1200;
-            }
+    // No saved data — fetch fresh from Riot API
+    try {
+        CURRENT_VERSION = await getLatestVersion();
 
-            if(c.sigma === undefined){
-                c.sigma = 350;
-            }
-            if(c.enabled === undefined) c.enabled = true;
+        const res = await fetch(
+            `https://ddragon.leagueoflegends.com/cdn/${CURRENT_VERSION}/data/en_US/champion.json`
+        );
+        if(!res.ok) throw new Error(`HTTP ${res.status}`);
 
-            // 🔥 convert old string roles → array
-            if(typeof c.roleLabel === "string"){
-                c.roleLabel = c.roleLabel.split("/");
-            }
+        const data  = await res.json();
+        const champs = Object.values(data.data);
 
-            if(!c.roleLabel && c.tags){
-                c.roleLabel = detectRoleLabel(c.tags, c.id, c.name);
+        champions = champs.map(c => ({
+            id:        c.id,
+            name:      c.name,
+            image:     `https://ddragon.leagueoflegends.com/cdn/${CURRENT_VERSION}/img/champion/${c.image.full}`,
+            tags:      c.tags,
+            mu:        1200,
+            sigma:     350,
+            wins:      0,
+            games:     0,
+            isNew:     false,
+            enabled:   true,
+            roleLabel: detectRoleLabel(c.tags, c.id, c.name)
+        }));
+
+        save();
+        refreshAll();
+
+    } catch(err) {
+        console.error("Failed to load champions from Riot API:", err);
+        const name1 = document.getElementById("name1");
+        if(name1) name1.textContent = "⚠️ Could not load champions. Check your connection.";
+    }
+}
+
+async function loadProgress(){
+    const saved = localStorage.getItem(getSlotKey());
+
+    if(saved){
+        champions = JSON.parse(saved);
+        champions.forEach(backfillChampion);
+    } else {
+        await loadChampions();
+        return;
+    }
+
+    refreshAll();
+}
+
+/* ---------- RESET ---------- */
+
+function resetAll(){
+    if(!confirm(`Reset Slot ${currentSlot}?`)) return;
+
+    // Reset ratings but preserve champion selection
+    champions.forEach(c => {
+        c.mu    = 1200;
+        c.sigma = 350;
+        c.games = 0;
+        c.wins  = 0;
+        c.isNew = false;
+        // DO NOT TOUCH c.enabled
+    });
+
+    recentMatches   = [];
+    recentChampions = [];
+
+    save();
+    refreshAll();
+}
+
+/* ---------- SYNC NEW CHAMPIONS ---------- */
+
+async function syncNewChampions(){
+
+    const btn = document.querySelector("button[onclick='syncNewChampions()']");
+    if(btn){ btn.textContent = "⏳ Syncing..."; btn.disabled = true; }
+
+    try {
+        const version = await getLatestVersion();
+
+        const res = await fetch(
+            `https://ddragon.leagueoflegends.com/cdn/${version}/data/en_US/champion.json`
+        );
+        if(!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        const data   = await res.json();
+        const latest = Object.values(data.data);
+
+        const existingIds = new Set(champions.map(c => c.id));
+        let added = 0;
+
+        latest.forEach(c => {
+            if(!existingIds.has(c.id)){
+                champions.push({
+                    id:        c.id,
+                    name:      c.name,
+                    image:     `https://ddragon.leagueoflegends.com/cdn/${version}/img/champion/${c.image.full}`,
+                    tags:      c.tags,
+                    mu:        1200,
+                    sigma:     350,
+                    wins:      0,
+                    games:     0,
+                    isNew:     true,
+                    enabled:   true,
+                    roleLabel: detectRoleLabel(c.tags, c.id, c.name)
+                });
+                added++;
             }
         });
 
-        startMatch();
-        drawTierLists();
-        updateStabilityDisplay();
-        updateProgress();
-        drawChampionPool();
-        return;
-    }
+        CURRENT_VERSION = version;
+        save();
+        refreshAll();
 
-    CURRENT_VERSION = await getLatestVersion();
-
-    const res = await fetch(
-        `https://ddragon.leagueoflegends.com/cdn/${CURRENT_VERSION}/data/en_US/champion.json`
-    );
-
-    const data = await res.json();
-    const champs = Object.values(data.data);
-
-    champions = champs.map(c=>({
-        id:c.id,
-        name:c.name,
-        image:`https://ddragon.leagueoflegends.com/cdn/${CURRENT_VERSION}/img/champion/${c.image.full}`,
-        tags:c.tags,
-        mu:1200,
-        sigma:350,
-        wins:0,
-        games:0,
-        isNew:false,
-        enabled:true, // ⭐ ADD THIS
-        roleLabel: detectRoleLabel(c.tags, c.id, c.name)
-    }));
-
-    save();
-    startMatch();
-    drawTierLists();
-    updateStabilityDisplay();
-    updateProgress();
-    drawChampionPool();
-    updatePoolCounter();
-}
-
-/* ---------- ROLE FILTER ---------- */
-
-function passesRoleFilter(champ){
-    if(!champ.enabled) return false;
-
-    const roleFilter = getCurrentRoleFilter();
-    if(roleFilter === "All") return true;
-
-    return champ.roleLabel.includes(roleFilter);
-}
-
-function setRoleFilter(role){
-
-    // ⭐ save per slot
-    slotRoleFilters[currentSlot] = role;
-
-    highlightActiveRole();
-    startMatch();
-    drawTierLists();
-    updateProgress();
-    updateStabilityDisplay();
-    drawChampionPool();
-    updatePoolCounter();
-}
-
-function getSlotKey(){
-    return `champions_slot_${currentSlot}`;
-}
-
-function rememberMatch(a, b) {
-    // store pair key sorted (A|B same as B|A)
-    const key = [a.id, b.id].sort().join("|");
-    recentMatches.unshift(key);
-    if (recentMatches.length > MATCH_HISTORY_LIMIT) {
-        recentMatches.pop();
-    }
-
-    // champion cooldown memory
-    recentChampions.unshift(a.id);
-    recentChampions.unshift(b.id);
-
-    if (recentChampions.length > MATCH_HISTORY_LIMIT * 2) {
-        recentChampions = recentChampions.slice(0, MATCH_HISTORY_LIMIT * 2);
-    }
-}
-
-function wasRecentPair(a, b) {
-    const key = [a.id, b.id].sort().join("|");
-    return recentMatches.includes(key);
-}
-
-function championCooldownScore(champId) {
-    // lower is better
-    let count = 0;
-    for (let i = 0; i < CHAMPION_COOLDOWN && i < recentChampions.length; i++) {
-        if (recentChampions[i] === champId) count++;
-    }
-    return count;
-}
-
-/* ---------- MATCHMAKING ---------- */
-
-function startMatch() {
-
-    const pool = champions.filter(passesRoleFilter);
-
-    if (pool.length < 2) {
-
-        currentMatch = [];
-
-        const name1 = document.getElementById("name1");
-        const name2 = document.getElementById("name2");
-
-        if(name1) name1.textContent = "Not enough champions";
-        if(name2) name2.textContent = "";
-
-        return;
-    }
-
-    // 1. PRIORITIZATION LOGIC
-    // Sort pool by games played (least games first)
-
-    const priorityPool = [...pool].sort(
-        (a, b) => (a.games || 0) - (b.games || 0)
-    );
-
-    // Pick Champion A with bias toward least played
-
-    const bias = pool.length > 40 ? 1.6 : 1.9;
-
-    const indexA = Math.floor(
-        Math.pow(Math.random(), bias) * priorityPool.length
-    );
-
-    const a = priorityPool[indexA];
-
-    /* ---------- SMART MATCHMAKING ---------- */
-
-    let eloWindow = 200;
-
-    if (pool.length < 40) eloWindow = 300;
-    if (pool.length < 20) eloWindow = 500;
-    if (pool.length < 10) eloWindow = 9999;
-
-    let candidates = pool.filter(c => {
-
-        if (c.id === a.id) return false;
-
-        if (Math.abs(getRating(c) - getRating(a)) > eloWindow)
-            return false;
-
-        return true;
-
-    });
-
-    if (candidates.length === 0) {
-        candidates = pool.filter(c => c.id !== a.id);
-    }
-
-    /* ---------- ANTI-REPEAT ---------- */
-
-    let filtered = candidates.filter(c => !wasRecentPair(a, c));
-
-    if (filtered.length < Math.max(2, Math.floor(pool.length * 0.15))) {
-        filtered = candidates;
-    }
-
-    /* ---------- PRIORITY SORT ---------- */
-
-    filtered.sort((x, y) => {
-
-        const cooldownX = championCooldownScore(x.id);
-        const cooldownY = championCooldownScore(y.id);
-
-        if (cooldownX !== cooldownY)
-            return cooldownX - cooldownY;
-
-        return (x.games || 0) - (y.games || 0);
-
-    });
-
-    /* ---------- FINAL PICK ---------- */
-
-    const topCandidates =
-        filtered.slice(
-            0,
-            Math.max(1, Math.floor(filtered.length * 0.3))
+        alert(added > 0
+            ? `✅ Added ${added} new champion${added > 1 ? "s" : ""}!`
+            : "✅ Already up to date. No new champions found."
         );
 
-    const b =
-        topCandidates[
-            Math.floor(Math.random() * topCandidates.length)
-        ];
-
-    currentMatch = [a, b];
-
-    rememberMatch(a, b);
-
-    showMatch();
-}
-
-/* ---------- DISPLAY ---------- */
-
-function showMatch(){
-
-    if(!currentMatch.length) return;
-
-    const [a,b]=currentMatch;
-
-    document.getElementById("img1").src = a.image;
-    document.getElementById("img2").src = b.image;
-
-    document.getElementById("name1").textContent =
-        `${a.name} | Est:${Math.round(a.mu)} | Rank:${Math.round(getRating(a))}`;
-
-    document.getElementById("name2").textContent =
-        `${b.name} | Est:${Math.round(b.mu)} | Rank:${Math.round(getRating(b))}`;
-
-    document.getElementById("tier1").textContent =
-        `Tier ${getTier(a)} • ${a.roleLabel.join("/")}`;
-
-    document.getElementById("tier2").textContent =
-        `Tier ${getTier(b)} • ${b.roleLabel.join("/")}`;
-}
-
-/* ---------- ELO ---------- */
-
-function chooseWinner(i){
-
-    if(!currentMatch.length) return;
-
-    const winner=currentMatch[i-1];
-    const loser=currentMatch[i===1?1:0];
-
-    updateRatings(winner, loser);
-
-    const pool = champions.filter(passesRoleFilter);
-    const required = getRequiredGames(pool.length);
-
-    if(winner.games >= required) winner.isNew = false;
-    if(loser.games >= required) loser.isNew = false;
-
-    save();
-    startMatch();
-    drawTierLists();
-    updateProgress();
-    updateStabilityDisplay(); // ⭐ ADD THIS
-}
-
-function expectedWin(a,b){
-
-    const diff = a.mu - b.mu;
-    const uncertainty = Math.sqrt(a.sigma*a.sigma + b.sigma*b.sigma);
-
-    return 1/(1+Math.exp(-diff/uncertainty));
-}
-
-function updateRatings(winner, loser){
-
-    const K = 32;
-
-    const expected = expectedWin(winner, loser);
-
-    const change = K * (1 - expected);
-
-    winner.mu += change;
-    loser.mu  -= change;
-
-    winner.sigma = Math.max(60, winner.sigma * 0.97);
-    loser.sigma  = Math.max(60, loser.sigma * 0.97);
-
-    winner.games++;
-    loser.games++;
-
-    winner.wins++;
-}
-
-function getTierDistribution(poolSize){
-
-    // ⭐ dynamic compression for small pools
-
-    if(poolSize < 10){
-        return [
-            {tier:"S+", pct:0.5},
-            {tier:"S", pct:0.5}
-        ];
+    } catch(err) {
+        console.error("Sync failed:", err);
+        alert("⚠️ Sync failed. Check your connection and try again.");
+    } finally {
+        if(btn){ btn.textContent = "Sync New Champions"; btn.disabled = false; }
     }
-
-    if(poolSize < 20){
-        return [
-            {tier:"S+", pct:0.20},
-            {tier:"S", pct:0.30},
-            {tier:"A", pct:0.30},
-            {tier:"B", pct:0.20}
-        ];
-    }
-
-    if(poolSize < 40){
-        return [
-            {tier:"S+", pct:0.10},
-            {tier:"S", pct:0.20},
-            {tier:"A", pct:0.25},
-            {tier:"B", pct:0.25},
-            {tier:"C", pct:0.20}
-        ];
-    }
-
-    // ⭐ full distribution
-    return [
-        {tier:"S+", pct:0.05},
-        {tier:"S", pct:0.15},
-        {tier:"A", pct:0.25},
-        {tier:"B", pct:0.25},
-        {tier:"C", pct:0.20},
-        {tier:"D", pct:0.10}
-    ];
 }
 
-/* ---------- TIERS ---------- */
-
-function getTier(champ){
-
-    const pool = cachedSortedPool.length
-        ? cachedSortedPool
-        : champions
-            .filter(passesRoleFilter)
-            .sort((a,b)=>getRating(b)-getRating(a));
-
-    if(pool.length === 0) return "S";
-
-    const dist = getTierDistribution(pool.length);
-
-    const index = pool.findIndex(c=>c.id === champ.id);
-    if(index === -1) return "S";
-
-    const positionPct = (index + 1) / pool.length;
-
-    let cumulative = 0;
-
-    for(const bucket of dist){
-        cumulative += bucket.pct;
-        if(positionPct <= cumulative){
-            return bucket.tier;
-        }
-    }
-
-    // fallback safety
-    return dist[dist.length - 1].tier;
-}
-
-function getRating(champ){
-    return champ.mu - 3*champ.sigma;
-}
-
-/* ---------- TIER BOARD ---------- */
-
-function drawTierLists(){
-
-    const pool = champions.filter(passesRoleFilter);
-    const dist = getTierDistribution(pool.length);
-    const activeTiers = dist.map(d => d.tier);
-
-    const ALL_TIERS = ["S+","S","A","B","C","D"];
-
-    // ⭐ show/hide tier columns using class (more reliable than style)
-    ALL_TIERS.forEach(t => {
-
-        const box = document.getElementById("tier-" + t);
-        if (!box) return;
-
-        box.innerHTML = "";
-
-        const wrapper = box.parentElement;
-
-        if (activeTiers.includes(t)) {
-            wrapper.classList.remove("hidden");
-        } else {
-            wrapper.classList.add("hidden");
-        }
-    });
-
-    // sort pool
-    cachedSortedPool = [...pool].sort((a,b) => getRating(b) - getRating(a));
-    const sorted = cachedSortedPool;
-
-    // fill tiers
-    sorted.forEach(c => {
-
-        const tier = getTier(c);
-        if (!activeTiers.includes(tier)) return;
-
-        const div = document.createElement("div");
-        div.className = "tierChamp";
-        div.textContent =
-            `${c.name} (${Math.round(getRating(c))}) — ${c.roleLabel.join("/")}`;
-
-        const target = document.getElementById("tier-" + tier);
-        if (target) target.appendChild(div);
-    });
-
-    updateStabilityDisplay();
-}
-
-/* ---------- EXPORT TXT ---------- */
+/* ---------- EXPORT ---------- */
 
 function exportTxt(){
 
     const sorted = [...champions]
         .filter(passesRoleFilter)
-        .sort((a,b)=>getRating(b)-getRating(a));
-    
+        .sort((a, b) => getRating(b) - getRating(a));
+
     if(sorted.length === 0){
         alert("No champions to export.");
         return;
     }
 
-    const TIERS = ["S+","S","A","B","C","D"];
+    const TIERS = ["S+", "S", "A", "B", "C", "D"];
+    let text = "Champion Elo Ranking\n====================\n\n";
 
-    let text = "Champion Elo Ranking\n";
-    text += "====================\n\n";
-
-    TIERS.forEach(tier=>{
-        const tierChamps = sorted.filter(c=>getTier(c)===tier);
+    TIERS.forEach(tier => {
+        const tierChamps = sorted.filter(c => getTier(c) === tier);
         if(tierChamps.length === 0) return;
 
         text += `===== TIER ${tier} =====\n`;
-
-        tierChamps.forEach((c,i)=>{
-            text += `${i+1}. ${c.name} — ${Math.round(getRating(c))} — ${c.roleLabel.join("/")}\n`;
+        tierChamps.forEach((c, i) => {
+            text += `${i + 1}. ${c.name} — ${Math.round(getRating(c))} — ${c.roleLabel.join("/")}\n`;
         });
-
         text += "\n";
     });
 
-    const blob = new Blob([text], {type:"text/plain"});
-    const url = URL.createObjectURL(blob);
-
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "champion_elo_tiers.txt";
-    a.click();
-
-    URL.revokeObjectURL(url);
+    downloadBlob(text, "champion_elo_tiers.txt", "text/plain");
 }
 
-/* ---------- EXPORT/IMPORT ---------- */
-
 function exportProgress(){
-
     const data = {
-        champions: champions,
-        version: CURRENT_VERSION,
-        roleFilter: getCurrentRoleFilter() // ⭐ FIX
+        champions:  champions,
+        version:    CURRENT_VERSION,
+        roleFilter: getCurrentRoleFilter()
     };
-
-    const blob = new Blob(
-        [JSON.stringify(data, null, 2)],
-        { type: "application/json" }
-    );
-
-    const url = URL.createObjectURL(blob);
-
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "champion_elo_progress.json";
-    a.click();
-
-    URL.revokeObjectURL(url);
+    downloadBlob(JSON.stringify(data, null, 2), "champion_elo_progress.json", "application/json");
 }
 
 function importProgress(event){
-
     const file = event.target.files[0];
     if(!file) return;
 
     const reader = new FileReader();
-
     reader.onload = function(e){
-        try{
+        try {
             const data = JSON.parse(e.target.result);
-
-            if(!data.champions){
-                alert("Invalid save file.");
-                return;
-            }
+            if(!data.champions){ alert("Invalid save file."); return; }
 
             champions = data.champions;
+            champions.forEach(backfillChampion);
             CURRENT_VERSION = data.version || CURRENT_VERSION;
             slotRoleFilters[currentSlot] = data.roleFilter || "All";
 
             save();
-            startMatch();
-            drawTierLists();
-            updateProgress();
-            updateStabilityDisplay();
-            drawChampionPool();
-
-        }catch(err){
+            refreshAll();
+        } catch(err) {
             alert("Error loading file.");
             console.error(err);
         }
     };
-
     reader.readAsText(file);
     event.target.value = "";
 }
 
-function updateProgress(){
+/* ---------- HELPER ---------- */
 
-    const pool = champions.filter(passesRoleFilter);
-
-    const bar = document.getElementById("progressBar");
-    const text = document.getElementById("progressText");
-
-    if(pool.length === 0){
-        if(text) text.textContent = "Checking...";
-        if(bar) bar.style.width = "0%";
-        return;
-    }
-
-    const required = getRequiredGames(pool.length);
-
-    let totalGames = 0;
-
-    pool.forEach(c=>{
-        totalGames += Math.min(c.games || 0, required);
-    });
-
-    const maxGames = pool.length * required;
-    const percent = Math.round((totalGames / maxGames) * 100);
-
-    if(bar) bar.style.width = percent + "%";
-
-    if(text) text.textContent =
-        percent + "% completed (" +
-        totalGames + "/" + maxGames +
-        ") • Target: " + required + " games";
+function downloadBlob(content, filename, type){
+    const blob = new Blob([content], { type });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
 }
+/* ==============================================
+   ui.js — DOM rendering and user interactions
+   ============================================== */
 
-async function loadProgress() {
-    const saved = localStorage.getItem(getSlotKey());
+/* ---------- CENTRAL REFRESH ---------- */
 
-    if (saved) {
-        champions = JSON.parse(saved);
-
-        champions.forEach(c => {
-            if (c.isNew === undefined) c.isNew = false;
-            if (c.games === undefined) c.games = 0;
-            if (c.wins === undefined) c.wins = 0;
-            if (c.enabled === undefined) c.enabled = true;
-
-            if (typeof c.roleLabel === "string") {
-                c.roleLabel = c.roleLabel.split("/");
-            }
-
-            if (!c.roleLabel && c.tags) {
-                c.roleLabel = detectRoleLabel(c.tags, c.id, c.name);
-            }
-        });
-
-    } else {
-        // ⭐ IMPORTANT: load fresh champions for this slot
-        await loadChampions();
-        return;
-    }
-
+// Call this after any state change to keep all UI in sync.
+function refreshAll(){
     startMatch();
     drawTierLists();
     updateProgress();
@@ -880,134 +714,219 @@ async function loadProgress() {
     updatePoolCounter();
 }
 
+/* ---------- MATCH DISPLAY ---------- */
+
+function showMatch(){
+    if(!currentMatch.length) return;
+
+    const [a, b] = currentMatch;
+
+    document.getElementById("img1").src = a.image;
+    document.getElementById("img2").src = b.image;
+
+    if(debugMode){
+        document.getElementById("name1").textContent = `${a.name} | Est:${Math.round(a.mu)} | Rank:${Math.round(getRating(a))}`;
+        document.getElementById("name2").textContent = `${b.name} | Est:${Math.round(b.mu)} | Rank:${Math.round(getRating(b))}`;
+    } else {
+        document.getElementById("name1").textContent = a.name;
+        document.getElementById("name2").textContent = b.name;
+    }
+
+    document.getElementById("tier1").textContent = `Tier ${getTier(a)} • ${a.roleLabel.join("/")}`;
+    document.getElementById("tier2").textContent = `Tier ${getTier(b)} • ${b.roleLabel.join("/")}`;
+}
+
+/* ---------- VOTE ---------- */
+
+function chooseWinner(i){
+    if(!currentMatch.length) return;
+
+    const winner = currentMatch[i - 1];
+    const loser  = currentMatch[i === 1 ? 1 : 0];
+
+    updateRatings(winner, loser);
+
+    const pool     = champions.filter(passesRoleFilter);
+    const required = getRequiredGames(pool.length);
+
+    if(winner.games >= required) winner.isNew = false;
+    if(loser.games  >= required) loser.isNew  = false;
+
+    save();
+    refreshAll();
+}
+
+/* ---------- TIER LIST ---------- */
+
+function drawTierLists(){
+
+    // Invalidate cache before rebuilding so getTier() never reads stale data
+    cachedSortedPool = [];
+
+    const pool        = champions.filter(passesRoleFilter);
+    const dist        = getTierDistribution(pool.length);
+    const activeTiers = dist.map(d => d.tier);
+    const ALL_TIERS   = ["S+", "S", "A", "B", "C", "D"];
+
+    // Show/hide tier columns
+    ALL_TIERS.forEach(t => {
+        const box = document.getElementById("tier-" + t);
+        if(!box) return;
+        box.innerHTML = "";
+        const wrapper = box.parentElement;
+        wrapper.classList.toggle("hidden", !activeTiers.includes(t));
+    });
+
+    // Sort and cache pool
+    cachedSortedPool = [...pool].sort((a, b) => getRating(b) - getRating(a));
+
+    // Populate tier columns
+    cachedSortedPool.forEach(c => {
+        const tier = getTier(c);
+        if(!activeTiers.includes(tier)) return;
+
+        const div = document.createElement("div");
+        div.className   = "tierChamp";
+        div.textContent = `${c.name} (${Math.round(getRating(c))}) — ${c.roleLabel.join("/")}`;
+
+        const target = document.getElementById("tier-" + tier);
+        if(target) target.appendChild(div);
+    });
+
+    updateStabilityDisplay();
+}
+
+function toggleTierList(){
+    const tiers = document.getElementById("tiers");
+    tiers.style.display = tiers.style.display === "none" ? "flex" : "none";
+}
+
+/* ---------- PROGRESS BAR ---------- */
+
+function updateProgress(){
+    const pool = champions.filter(passesRoleFilter);
+    const bar  = document.getElementById("progressBar");
+    const text = document.getElementById("progressText");
+
+    if(pool.length === 0){
+        if(text) text.textContent = "Checking...";
+        if(bar)  bar.style.width  = "0%";
+        return;
+    }
+
+    const required   = getRequiredGames(pool.length);
+    let   totalGames = 0;
+
+    pool.forEach(c => { totalGames += Math.min(c.games || 0, required); });
+
+    const maxGames = pool.length * required;
+    const percent  = Math.round((totalGames / maxGames) * 100);
+
+    if(bar)  bar.style.width    = percent + "%";
+    if(text) text.textContent   =
+        `${percent}% completed (${totalGames}/${maxGames}) • Target: ${required} games`;
+}
+
+/* ---------- STABILITY BADGE ---------- */
+
 function updateStabilityDisplay(){
-
     const badge = document.getElementById("stabilityBadge");
-    const text = document.getElementById("stabilityText");
-
+    const text  = document.getElementById("stabilityText");
     if(!badge || !text) return;
 
     const pool = champions.filter(passesRoleFilter);
 
     if(pool.length === 0){
-        badge.textContent = "Checking...";
-        text.textContent = "";
+        badge.textContent    = "Checking...";
         badge.style.background = "#666";
+        text.textContent     = "";
         return;
     }
 
-    const required = getRequiredGames(pool.length);
-
-    /* ---------- ⭐ HARD ZERO GUARD ---------- */
-
-    let totalGames = 0;
+    const required   = getRequiredGames(pool.length);
+    let   totalGames = 0;
     pool.forEach(c => totalGames += (c.games || 0));
 
-    if (totalGames === 0) {
-        badge.textContent = "Checking...";
+    if(totalGames === 0){
+        badge.textContent    = "Checking...";
         badge.style.background = "#666";
-        text.textContent = "0% confidence";
+        text.textContent     = "0% confidence";
         return;
     }
 
-    /* ---------- ⭐ SMOOTH CONFIDENCE ---------- */
+    const POWER = 2.2; // slow early, accelerates toward stability
+    let   stabilityScore = 0;
 
-    let stabilityScore = 0;
-
-    const POWER = 2.2; // ⭐ tuning knob (see below)
-
-    pool.forEach(c=>{
-        const games = c.games || 0;
-        const ratio = Math.min(games / required, 1);
-
-        // ⭐ slow early, smooth later
-        const champConfidence = Math.pow(ratio, POWER);
-
-        stabilityScore += champConfidence;
+    pool.forEach(c => {
+        const ratio = Math.min((c.games || 0) / required, 1);
+        stabilityScore += Math.pow(ratio, POWER);
     });
 
     const percent = Math.round((stabilityScore / pool.length) * 100);
 
-    /* ---------- BADGE LOGIC ---------- */
-
     if(percent < 30){
-        badge.textContent = "Unstable";
+        badge.textContent      = "Unstable";
         badge.style.background = "#e53935";
-    }else if(percent < 70){
-        badge.textContent = "Getting there";
+    } else if(percent < 70){
+        badge.textContent      = "Getting there";
         badge.style.background = "#fbc02d";
-    }else if(percent < 95){
-        badge.textContent = "Mostly stable";
+    } else if(percent < 95){
+        badge.textContent      = "Mostly stable";
         badge.style.background = "#43a047";
-    }else{
-        badge.textContent = "Stable";
+    } else {
+        badge.textContent      = "Stable";
         badge.style.background = "#2e7d32";
     }
 
     text.textContent = percent + "% confidence";
 }
 
-async function selectSlot(slotNumber) {
-    currentSlot = slotNumber;
-    highlightActiveSlot();
-
-    champions = [];
-    await loadProgress();
-
-    highlightActiveRole(); // ⭐ IMPORTANT
-}
+/* ---------- CHAMPION POOL ---------- */
 
 function drawChampionPool(){
     const container = document.getElementById("championPool");
     if(!container) return;
 
     container.innerHTML = "";
-    const sorted = [...champions].sort((a,b)=>a.name.localeCompare(b.name));
+    const roleFilter = getCurrentRoleFilter();
+    const sorted     = [...champions].sort((a, b) => a.name.localeCompare(b.name));
 
-    sorted.forEach(champ=>{
-        const roleFilter = getCurrentRoleFilter();
+    sorted.forEach(champ => {
         if(roleFilter !== "All" && !champ.roleLabel.includes(roleFilter)) return;
 
-        const card = document.createElement("div");
+        const card     = document.createElement("div");
         card.className = "poolChamp" + (champ.enabled ? "" : " disabled");
 
-        const checkbox = document.createElement("input");
-        checkbox.type = "checkbox";
-        checkbox.checked = champ.enabled;
+        const checkbox    = document.createElement("input");
+        checkbox.type     = "checkbox";
+        checkbox.checked  = champ.enabled;
 
-        // Optimized Toggle
+        // Optimized toggle: update card visuals immediately, defer heavy redraw
+        const onToggle = () => {
+            card.classList.toggle("disabled", !champ.enabled);
+            save();
+            startMatch();
+            drawTierLists();
+            updateProgress();
+            updateStabilityDisplay();
+            updatePoolCounter();
+        };
+
         checkbox.onchange = () => {
             champ.enabled = checkbox.checked;
-            // Update UI without rebuilding everything
-            card.classList.toggle("disabled", !champ.enabled);
-            save();
-            startMatch();
-            drawTierLists();
-            updateProgress();
-            updateStabilityDisplay();
-            updatePoolCounter();
+            onToggle();
         };
+
         card.onclick = (e) => {
-
-            // prevent double trigger if checkbox itself was clicked
             if(e.target === checkbox) return;
-
-            champ.enabled = !champ.enabled;
+            champ.enabled    = !champ.enabled;
             checkbox.checked = champ.enabled;
-
-            card.classList.toggle("disabled", !champ.enabled);
-
-            save();
-            startMatch();
-            drawTierLists();
-            updateProgress();
-            updateStabilityDisplay();
-            updatePoolCounter();
+            onToggle();
         };
 
-        const img = document.createElement("img");
-        img.src = champ.image;
-        const name = document.createElement("div");
+        const img       = document.createElement("img");
+        img.src         = champ.image;
+        const name      = document.createElement("div");
         name.textContent = champ.name;
 
         card.appendChild(checkbox);
@@ -1017,135 +936,76 @@ function drawChampionPool(){
     });
 }
 
-/* ---------- SELECT ALL / NONE ---------- */
-
-/* ---------- SELECT ALL / NONE (VISIBLE ONLY) ---------- */
-
 function setAllChampions(enabled){
-
     const roleFilter = getCurrentRoleFilter();
-
-    let changed = false;
+    let   changed    = false;
 
     champions.forEach(champ => {
-
-        if(roleFilter !== "All" &&
-           !champ.roleLabel.includes(roleFilter)){
-            return;
-        }
-
-        if(champ.enabled !== enabled){
-            champ.enabled = enabled;
-            changed = true;
-        }
+        if(roleFilter !== "All" && !champ.roleLabel.includes(roleFilter)) return;
+        if(champ.enabled !== enabled){ champ.enabled = enabled; changed = true; }
     });
 
     if(!changed) return;
-
     save();
-
-    startMatch();
-    drawTierLists();
-    updateProgress();
-    updateStabilityDisplay();
-    drawChampionPool();
-    updatePoolCounter();
+    refreshAll();
 }
-
-function highlightActiveRole(){
-
-    const roleFilter = getCurrentRoleFilter();
-
-    document.querySelectorAll("button[onclick^='setRoleFilter']").forEach(btn=>{
-        btn.classList.remove("active");
-
-        if(btn.textContent === roleFilter){
-            btn.classList.add("active");
-        }
-    });
-}
-
-/* ---------- POOL COUNTER ---------- */
 
 function updatePoolCounter(){
-
     const el = document.getElementById("poolCounter");
     if(!el) return;
 
+    const roleFilter    = getCurrentRoleFilter();
+    const visible       = champions.filter(c => roleFilter === "All" || c.roleLabel.includes(roleFilter));
+    const enabledCount  = visible.filter(c => c.enabled).length;
+    const label         = roleFilter === "All" ? "All Pool" : roleFilter + " Pool";
+
+    el.textContent = `${label}: ${enabledCount} / ${visible.length} selected`;
+}
+
+/* ---------- ROLE FILTER ---------- */
+
+function setRoleFilter(role){
+    slotRoleFilters[currentSlot] = role;
+    highlightActiveRole();
+    refreshAll();
+}
+
+function highlightActiveRole(){
     const roleFilter = getCurrentRoleFilter();
-
-    const visible = champions.filter(c=>{
-        if(roleFilter === "All") return true;
-        return c.roleLabel.includes(roleFilter);
+    document.querySelectorAll(".roleBtn").forEach(btn => {
+        btn.classList.toggle("active", btn.dataset.role === roleFilter);
     });
-
-    const enabledVisible = visible.filter(c=>c.enabled);
-
-    const label = roleFilter === "All"
-        ? "All Pool"
-        : roleFilter + " Pool";
-
-    el.textContent =
-        `${label}: ${enabledVisible.length} / ${visible.length} selected`;
 }
 
-/* ---------- TOGGLE TIERLIST ---------- */
+/* ---------- SLOTS ---------- */
 
-function toggleTierList(){
-    const tiers = document.getElementById("tiers");
-
-    if(tiers.style.display === "none"){
-        tiers.style.display = "flex";
-    } else {
-        tiers.style.display = "none";
-    }
-}
-
-/* ---------- SAVE / RESET ---------- */
-
-function save(){
-    localStorage.setItem(getSlotKey(), JSON.stringify(champions));
-}
-
-function resetAll(){
-    if (!confirm(`Reset Slot ${currentSlot}?`)) return;
-
-    // ⭐ reset stats BUT keep selection
-    champions.forEach(c => {
-        c.mu = 1200;
-        c.sigma = 350;
-        c.games = 0;
-        c.wins = 0;
-        c.isNew = false;
-        // ⭐ IMPORTANT: DO NOT TOUCH c.enabled
-    });
-
-    // ⭐ clear matchmaking memory
-    recentMatches = [];
-    recentChampions = [];
-
-    save();
-
-    startMatch();
-    drawTierLists();
-    updateProgress();
-    updateStabilityDisplay();
-    updatePoolCounter();
+async function selectSlot(slotNumber){
+    currentSlot = slotNumber;
+    highlightActiveSlot();
+    champions = [];
+    await loadProgress();
+    highlightActiveRole();
 }
 
 function highlightActiveSlot(){
-
-    document.querySelectorAll(".slotBtn").forEach(btn=>{
-        btn.classList.remove("active");
-
-        if(Number(btn.dataset.slot) === currentSlot){
-            btn.classList.add("active");
-        }
+    document.querySelectorAll(".slotBtn").forEach(btn => {
+        btn.classList.toggle("active", Number(btn.dataset.slot) === currentSlot);
     });
-
 }
 
-/* ---------- START ---------- */
+/* ---------- DEBUG MODE ---------- */
+
+function toggleDebug(){
+    debugMode = !debugMode;
+    showMatch();
+    document.querySelectorAll("button").forEach(btn => {
+        if(btn.textContent.includes("Debug")){
+            btn.style.background = debugMode ? "#4a4a00" : "";
+        }
+    });
+}
+
+/* ---------- INIT ---------- */
 
 (async function(){
     await loadChampions();

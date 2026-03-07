@@ -43,15 +43,14 @@
   <button class="slotBtn" data-slot="3" onclick="selectSlot(3)">Slot 3</button>
 </div>
 
+<button onclick="toggleDebug()">🔧 Debug</button>
 <button onclick="exportTxt()">📄 Export TXT</button>
 <button onclick="syncNewChampions()">Sync New Champions</button>
 <button type="button" onclick="resetAll()">Reset</button>
 <button onclick="exportProgress()">💾 Download</button>
 
-<label class="uploadBtn">
-    📂 Load
-    <input type="file" accept=".json" onchange="importProgress(event)" hidden>
-</label>
+<button onclick="document.getElementById('fileInput').click()">📂 Load</button>
+<input type="file" id="fileInput" accept=".json" onchange="importProgress(event)" style="display:none">
 
 
 <div id="ranking" style="display:none;"></div>
@@ -70,15 +69,16 @@
 <h2>Champion Pool</h2>
 <button onclick="setAllChampions(true)">Select All</button>
 <button onclick="setAllChampions(false)">Select None</button>
-<button onclick="setRoleFilter('All')">All</button>
-<button onclick="setRoleFilter('Top')">Top</button>
-<button onclick="setRoleFilter('Jungle')">Jungle</button>
-<button onclick="setRoleFilter('Mid')">Mid</button>
-<button onclick="setRoleFilter('ADC')">ADC</button>
-<button onclick="setRoleFilter('Support')">Support</button>
+<button class="roleBtn" data-role="All" onclick="setRoleFilter('All')">All</button>
+<button class="roleBtn" data-role="Top" onclick="setRoleFilter('Top')">Top</button>
+<button class="roleBtn" data-role="Jungle" onclick="setRoleFilter('Jungle')">Jungle</button>
+<button class="roleBtn" data-role="Mid" onclick="setRoleFilter('Mid')">Mid</button>
+<button class="roleBtn" data-role="ADC" onclick="setRoleFilter('ADC')">ADC</button>
+<button class="roleBtn" data-role="Support" onclick="setRoleFilter('Support')">Support</button>
 <div id="poolCounter">0 / 0 selected</div>
 <div id="championPool"></div>
 
+<!-- Load order matters: state → roles → rating → matchmaking → storage → ui -->
 <script src="script.js"></script>
 </body>
 </html>
